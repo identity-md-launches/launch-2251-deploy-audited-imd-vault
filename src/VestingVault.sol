@@ -4,7 +4,6 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title VestingVault
 /// @notice Holds tokens and releases them to a beneficiary on a schedule: nothing during the cliff, then linearly
@@ -118,14 +117,13 @@ contract VestingVault is ReentrancyGuard {
     }
 
     /// @notice How much of `asset` has vested by `timestamp`, released or not.
-    /// @dev `mulDiv`, so an allocation near `uint256` max still vests linearly instead of reverting until the end.
     function vestedAmount(address asset, uint64 timestamp) public view returns (uint256) {
         uint64 from = unlockStart(asset);
         if (from == 0 || timestamp < from) return 0;
         uint256 total = totalAllocation(asset);
         uint64 elapsed = timestamp - from;
         if (elapsed >= duration) return total;
-        return Math.mulDiv(total, elapsed, duration);
+        return (total * elapsed) / duration;
     }
 
     /// @notice Records that an open vault now holds `asset`, which starts that token's clock: its linear unlock

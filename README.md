@@ -32,14 +32,23 @@ Nothing has an admin, a pause, an upgrade path or an emergency withdrawal.
   transfer: a balance that fell is charged against that asset's window too, so a token with two addresses to one
   balance (a legacy contract forwarding to the main token, a proxy and its target) shares one 25% window once both
   addresses have been queued. An address nobody queued keeps a window of its own. A tracked asset that can not be
-  read (no code, a reverting `balanceOf`, or one that needs more than `BALANCE_READ_GAS` = 100 000 gas) is skipped,
-  never a block: each read gets that fixed stipend and only its first word is copied, so a tracked token that later
-  burns gas or returns a huge payload counts as zero instead of running the withdrawal out of gas. The manager alone
-  grows that set and pays for the loop it adds. The set trusts what a tracked token answers: a token that lies about
-  its balance (reports it falling when another asset leaves) can make ERC-20 withdrawals revert against its window;
-  only the manager can bring a token into the set.
-- The cap and the vesting amount are computed with `mulDiv`, so a balance or allocation near `2^256` (uint256-max
-  supplies exist) is capped and vested like any other instead of reverting.
+  read (no code, or a reverting `balanceOf`) is skipped, never a block. The manager alone grows that set and pays for
+  the loop it adds, and nothing removes an asset from it. The set trusts what a tracked token answers, so the
+  manager must only ever queue tokens whose contract it trusts (never an unsolicited airdrop: leave it where it is).
+  A tracked token that later turns hostile can block every ERC-20 withdrawal, though never ETH and never take
+  anything: one that lies about its balance (reports it falling when another asset leaves) makes `execute` revert
+  `OverWeeklyCap` against its own window; one whose `balanceOf` burns all the gas it is given or returns a huge
+  payload makes `execute` run out of gas. The cap is checked only for the asset being withdrawn by its nominal
+  amount, so a token that debits the sender more than the amount (a burn on top of the transfer) can let more than
+  `rateBps` leave, and `availableThisWeek` answers from the asset's own window only, so for a second address to a
+  balance whose main address is spent it can report more than `execute` will allow until that address is tracked.
+- The cap (`balance × rateBps`) and the vesting amount (`total × elapsed`) are computed in checked arithmetic, so a
+  balance above `2^256 / rateBps` or an allocation above `2^256 / duration` (about `4.6e73` and `4.8e70` base units
+  at the 25% ceiling and 28-day floor) makes the cap revert and the vesting revert until the schedule ends. No real
+  token's supply comes near those; a `uint256`-max supply token is the only case, and such a token must not be put
+  in these vaults.
+- A vesting vault releases the whole releasable amount at once, so a token that debits the sender more than the
+  amount can not complete the final release of a bound vault; such a token must not be vested here.
 - Anyone can execute a due withdrawal, so anyone can choose the moment an epoch's cap is fixed. Executing a small
   withdrawal just before a large deposit lands pins the cap to the pre-deposit balance for that epoch, and a large
   withdrawal queued earlier waits for the next epoch, which opens on the full balance. That is the rule above as
@@ -53,7 +62,12 @@ Nothing has an admin, a pause, an upgrade path or an emergency withdrawal.
 - Vesting is calendar-based per token, not per tranche: a top-up of a token the vault already holds (or already
   recorded, in an open vault) is unlocked by the fraction of the schedule that has elapsed, and anything that
   arrives after the schedule has run is releasable at once. The radar counts locked supply as `balance −
-  releasable(token)`, never as the balance, and a top-up after the schedule has advanced is not a lock.
+  releasable(token)`, never as the balance, and a top-up after the schedule has advanced is not a lock. In an open
+  vault a token's arrival is recorded once, the first time `sync` or `release` sees a nonzero balance, and anyone
+  holding a wei of a token that already exists can send it and record that arrival early: the real tranche then lands
+  as a calendar top-up on that clock. So an open vault's arrival clock is only trustworthy for a token minted in the
+  funding transaction itself (an IMD launch), and the radar refuses its seal to an open vault holding a token that
+  existed before the vault did; for such a token use a bound vault (`createVesting`).
 - An open vesting vault accounts per token address. A token with two addresses to one balance would get a schedule
   per address (up to 43.75% in the first week through both). The contracts can not guard this without a set of
   other assets to watch, which anyone could pad through `sync()`, so the radar refuses its seal to an open vault
@@ -104,15 +118,16 @@ audit finding fixed before the launch (see [ADAPTATION.md](ADAPTATION.md)): the 
 vaults, the schedule overflow, `recover()` against double-entry tokens, the treasury's own 24h floor, the real
 bound of the epoch cap, the shared cap of a double-entry token in a treasury, the fixed expiry of a queued
 withdrawal, the pending manager's delay, the creator in the registry and the received amount in `VestingCreated`;
-and, from the Robinhood launch, the zero-argument factory on chain 4663, the overflow-free cap and vesting math, the
-gas stipend on tracked-asset reads and the documented cap-pinning bound.
+and, from the Robinhood launch, that the tree still compiles to the mainnet factory's exact runtime, the zero-argument
+factory on chain 4663 and the documented cap-pinning bound.
 
 ## Addresses
 
 - IMD (Ethereum): `0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`
 - VaultFactory (Ethereum, launch 2244): `0xdbaff609cd0500527a2a102f5cbbbbc70fd2ff5b`, `new VaultFactory(IMD, radarWallet)`.
-- VaultFactory (Robinhood Chain, 4663): deployed by the IMD launch as `new VaultFactory(address(0), address(0))`;
-  no fee on this chain, `payFor(4663, token)` on the Ethereum factory instead.
+- VaultFactory (Robinhood Chain, 4663): deployed by the IMD launch as `VaultFactoryNoFee`, whose code and immutables
+  are exactly `new VaultFactory(address(0), address(0))` of the same audited source; no fee on this chain,
+  `payFor(4663, token)` on the Ethereum factory instead.
 
 ## The IMD RADAR seal
 

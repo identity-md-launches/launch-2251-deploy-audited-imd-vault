@@ -4,7 +4,6 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title TreasuryVault
 /// @notice A project treasury that nobody owns. Anyone can deposit tokens or ETH. A manager can only announce a
@@ -23,9 +22,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///      before and after the transfer, and any balance that fell is charged against that asset's window as well,
 ///      as if it had been withdrawn through that address. Only the manager grows that set, by queueing, so only the
 ///      manager pays for the loop it adds. An asset nobody queued keeps a window of its own, since the vault can not
-///      tell that two addresses share a balance until both are used. Each of those balance reads gets at most
-///      `BALANCE_READ_GAS` and only its first word is copied, so a tracked asset that later burns gas or returns a
-///      huge payload reads as zero instead of exhausting the withdrawal's gas.
+///      tell that two addresses share a balance until both are used.
 contract TreasuryVault is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -38,9 +35,6 @@ contract TreasuryVault is ReentrancyGuard {
     uint256 public constant BPS = 10_000;
     /// @notice At most 25% of a treasury can leave per week.
     uint16 public constant MAX_RATE_BPS = 2_500;
-    /// @notice Gas given to each `balanceOf` read of a tracked asset while another asset is withdrawn. Enough for any
-    ///         ERC-20, proxied or rebasing; a read that needs more counts as zero rather than blocking the withdrawal.
-    uint256 public constant BALANCE_READ_GAS = 100_000;
 
     /// @notice The project this treasury belongs to (informational: the radar files the vault under this token).
     address public immutable projectToken;
@@ -308,7 +302,7 @@ contract TreasuryVault is ReentrancyGuard {
     /// @notice What can still leave this epoch for `asset`, if a withdrawal executed right now.
     function availableThisWeek(address asset) external view returns (uint256) {
         Window memory win = windows[asset];
-        if (win.epoch != uint64(block.timestamp / EPOCH)) return _cap(_balance(asset));
+        if (win.epoch != uint64(block.timestamp / EPOCH)) return (_balance(asset) * rateBps) / BPS;
         return win.cap - win.spent;
     }
 
@@ -335,26 +329,13 @@ contract TreasuryVault is ReentrancyGuard {
         return asset == ETH ? address(this).balance : IERC20(asset).balanceOf(address(this));
     }
 
-    /// @dev `balanceOf` of a tracked asset, or zero when the call fails (an address without code, a token that
-    ///      reverts, or one that needs more than `BALANCE_READ_GAS`) or returns less than a word: a watched asset
-    ///      that can not be read never blocks the others' withdrawals. The call gets a fixed gas stipend and only the
-    ///      first return word is copied, so neither a gas-burning nor a payload-bombing `balanceOf` can exhaust the
-    ///      caller's gas.
-    function _tryBalance(address asset) internal view returns (uint256 held) {
-        bytes memory data = abi.encodeWithSelector(IERC20.balanceOf.selector, address(this));
-        uint256 stipend = BALANCE_READ_GAS;
-        assembly ("memory-safe") {
-            let ok := staticcall(stipend, asset, add(data, 32), mload(data), 0, 0)
-            if and(ok, gt(returndatasize(), 31)) {
-                returndatacopy(0, 0, 32)
-                held := mload(0)
-            }
-        }
-    }
-
-    /// @dev `rateBps` of `balance`, rounded down, without an intermediate overflow for balances near `uint256` max.
-    function _cap(uint256 balance) internal view returns (uint256) {
-        return Math.mulDiv(balance, rateBps, BPS);
+    /// @dev `balanceOf` of a tracked asset, or zero when the call fails (an address without code, or a token that
+    ///      reverts): a watched asset that can not be read never blocks the others' withdrawals.
+    function _tryBalance(address asset) internal view returns (uint256) {
+        (bool ok, bytes memory data) =
+            asset.staticcall(abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)));
+        if (!ok || data.length < 32) return 0;
+        return abi.decode(data, (uint256));
     }
 
     /// @dev Charges `amount` against `win` for the current epoch, opening it on `balance` (the balance before the
@@ -363,7 +344,7 @@ contract TreasuryVault is ReentrancyGuard {
         uint64 epoch = uint64(block.timestamp / EPOCH);
         if (win.epoch != epoch) {
             win.epoch = epoch;
-            win.cap = _cap(balance);
+            win.cap = (balance * rateBps) / BPS;
             win.spent = 0;
         }
         uint256 available = win.cap - win.spent;

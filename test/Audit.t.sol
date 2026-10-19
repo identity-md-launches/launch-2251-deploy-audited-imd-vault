@@ -65,81 +65,6 @@ contract AuditFeeToken is AuditToken {
     }
 }
 
-/// @dev A token with a uint256-max supply, as some meme tokens have.
-contract MaxSupplyToken is ERC20 {
-    constructor() ERC20("MAX", "MAX") {
-        _mint(msg.sender, type(uint256).max);
-    }
-}
-
-/// @dev A tracked token that turns hostile: while `hostile`, `balanceOf` burns every unit of gas it is given.
-contract GasBurningToken is AuditToken {
-    bool public hostile;
-
-    constructor() AuditToken("BURN") {}
-
-    function setHostile(bool h) external {
-        hostile = h;
-    }
-
-    function balanceOf(address a) public view override returns (uint256) {
-        if (hostile) {
-            uint256 x;
-            while (true) {
-                x = uint256(keccak256(abi.encode(x)));
-            }
-        }
-        return super.balanceOf(a);
-    }
-}
-
-/// @dev A tracked token that turns hostile: while `hostile`, `balanceOf` tries to return a 1 MiB payload.
-contract PayloadBombToken is AuditToken {
-    bool public hostile;
-
-    constructor() AuditToken("BOMB") {}
-
-    function setHostile(bool h) external {
-        hostile = h;
-    }
-
-    function balanceOf(address a) public view override returns (uint256) {
-        if (hostile) {
-            assembly {
-                return(0, 0x100000)
-            }
-        }
-        return super.balanceOf(a);
-    }
-}
-
-/// @dev A second entry point whose `balanceOf` is expensive but honest (about 60k gas of work before it answers),
-///      like a token that derives balances from several storage reads: it must still be read under the stipend.
-contract SlowLegacyEntry {
-    DoubleEntryToken immutable main;
-    uint256[] private pad;
-
-    constructor(DoubleEntryToken main_) {
-        main = main_;
-        for (uint256 i; i < 25; ++i) {
-            pad.push(i + 1);
-        }
-    }
-
-    function balanceOf(address a) external view returns (uint256) {
-        uint256 sink;
-        for (uint256 i; i < pad.length; ++i) {
-            sink += pad[i]; // 25 cold reads, about 55k gas
-        }
-        return sink == 0 ? 0 : main.balanceOf(a);
-    }
-
-    function transfer(address to, uint256 amount) external returns (bool) {
-        main.transferFor(msg.sender, to, amount);
-        return true;
-    }
-}
-
 /// @notice One test per audit finding fixed in ADAPTATION.md. Each reproduced on the code as it arrived.
 contract AuditTest is Test {
     address radar = makeAddr("radar");
@@ -627,7 +552,25 @@ contract AuditTest is Test {
         assertEq(fee.balanceOf(address(v)), 990e18);
     }
 
-    // =================== Robinhood launch (chain 4663): the fixes below were made for it ===================
+    // =================== Robinhood launch (chain 4663): the audited code, unchanged, with zero arguments ===================
+
+    /// @dev The brief: deploy the code audited and deployed on Ethereum in launch 2244, unchanged. The factory embeds
+    ///      the init code of both vaults, so its runtime is a fingerprint of all three sources: compiled with the
+    ///      Ethereum arguments it must equal the code at 0xdbaff609cd0500527a2a102f5cbbbbc70fd2ff5b (18,760 bytes,
+    ///      read with `cast code` from a public Ethereum RPC on 2026-10-19). Any edit to `VaultFactory.sol`,
+    ///      `VestingVault.sol` or `TreasuryVault.sol`, or to the compiler settings, fails this test.
+    function test_TreeCompilesToTheAuditedMainnetFactory() public {
+        vm.chainId(1);
+        VaultFactory f = new VaultFactory(
+            IERC20(0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7), 0x75dF3d2E7a1d23021e5d7EF06312D13009E9BBb8
+        );
+        assertEq(address(f).code.length, 18_760, "runtime length differs from launch 2244");
+        assertEq(
+            address(f).codehash,
+            0x4e60104bbd26773631103e40fbbf5713e12e2d485564c8ee7222fbe57e30f98a,
+            "runtime differs from the audited mainnet factory"
+        );
+    }
 
     // =================== d9f3f847: the Ethereum constructor arguments brick the factory on Robinhood ===================
 
@@ -731,134 +674,6 @@ contract AuditTest is Test {
         vm.prank(project);
         factory.createLaunchVesting(team, uint64(block.timestamp), 0, 28 days);
         assertEq(imd.balanceOf(radar), 5e18);
-    }
-
-    // =================== 8894516c: the weekly cap overflowed for huge balances and locked the asset ===================
-
-    function test_TreasuryCapHasNoOverflowForHugeBalances() public {
-        vm.prank(project);
-        TreasuryVault t = factory.createTreasury(address(token), project, 1 days, 2500, new address[](0));
-        MaxSupplyToken huge = new MaxSupplyToken();
-        huge.transfer(address(t), 1 << 255);
-        vm.prank(project);
-        uint256 id = t.queue(address(huge), multisig, 1e18);
-        vm.warp(block.timestamp + 1 days);
-
-        uint256 cap = t.availableThisWeek(address(huge));
-        assertEq(cap, (1 << 255) / 4);
-        t.execute(id);
-        assertEq(huge.balanceOf(multisig), 1e18);
-        assertEq(t.availableThisWeek(address(huge)), cap - 1e18);
-
-        // The whole cap can leave, and not a wei more, even at the largest possible balance.
-        huge.transfer(address(t), type(uint256).max - (1 << 255));
-        vm.warp((block.timestamp / t.EPOCH() + 1) * t.EPOCH());
-        uint256 held = huge.balanceOf(address(t));
-        vm.startPrank(project);
-        uint256 all = t.queue(address(huge), multisig, held / 4);
-        uint256 more = t.queue(address(huge), multisig, 1);
-        vm.stopPrank();
-        vm.warp(block.timestamp + 1 days);
-        assertEq(t.availableThisWeek(address(huge)), held / 4);
-        t.execute(all);
-        vm.expectRevert(abi.encodeWithSelector(TreasuryVault.OverWeeklyCap.selector, 0));
-        t.execute(more);
-    }
-
-    // =================== 53c7bd14: the vesting math overflowed for huge allocations ===================
-
-    function test_VestingHugeAllocationVestsLinearly() public {
-        MaxSupplyToken huge = new MaxSupplyToken();
-        huge.approve(address(factory), type(uint256).max);
-        imd.mint(address(this), 5e18);
-        imd.approve(address(factory), 5e18);
-        VestingVault v =
-            factory.createVesting(IERC20(address(huge)), team, type(uint256).max, uint64(block.timestamp), 0, 28 days);
-        assertEq(v.releasable(address(huge)), 0);
-        vm.warp(block.timestamp + 1 days);
-        assertEq(v.releasable(address(huge)), type(uint256).max / 28);
-        v.release(address(huge));
-        assertEq(huge.balanceOf(team), type(uint256).max / 28);
-        vm.warp(block.timestamp + 6 days);
-        assertEq(v.vestedAmount(address(huge), uint64(block.timestamp)), type(uint256).max / 4);
-        v.release(address(huge));
-        assertEq(huge.balanceOf(team), type(uint256).max / 4);
-        vm.warp(block.timestamp + 21 days);
-        v.release(address(huge));
-        assertEq(huge.balanceOf(team), type(uint256).max);
-    }
-
-    // =================== 959cdd52: a tracked asset that turned hostile froze every ERC-20 withdrawal ===================
-
-    function _hostileSetup(AuditToken hostile)
-        internal
-        returns (TreasuryVault t, uint256 viaToken, uint256 viaImd, uint256 viaHostile)
-    {
-        vm.prank(project);
-        t = factory.createTreasury(address(token), project, 1 days, 2500, new address[](0));
-        hostile.mint(address(t), 100e18);
-        token.mint(address(t), 1000e18);
-        imd.mint(address(t), 100e18);
-        vm.startPrank(project);
-        viaHostile = t.queue(address(hostile), multisig, 1e18); // the asset is tracked while it is still benign
-        viaToken = t.queue(address(token), multisig, 250e18);
-        viaImd = t.queue(address(imd), multisig, 25e18);
-        vm.stopPrank();
-        vm.warp(block.timestamp + 1 days);
-    }
-
-    function test_GasBurningTrackedAssetCanNotBlockOtherWithdrawals() public {
-        GasBurningToken burner = new GasBurningToken();
-        (TreasuryVault t, uint256 a, uint256 b, uint256 h) = _hostileSetup(burner);
-        burner.setHostile(true);
-        // Before the fix each read forwarded all gas and left the caller 1/64: this call ran out of gas.
-        t.execute{gas: 10_000_000}(a);
-        t.execute{gas: 2_000_000}(b);
-        assertEq(token.balanceOf(multisig), 250e18);
-        assertEq(imd.balanceOf(multisig), 25e18);
-        // The unreadable asset is charged nothing, and its own withdrawal fails only because it reverts itself.
-        (uint64 epoch,,) = t.windows(address(burner));
-        assertEq(epoch, 0);
-        vm.expectRevert();
-        t.execute(h);
-        // Once it is benign again it is read and charged as before.
-        burner.setHostile(false);
-        t.execute(h);
-        assertEq(burner.balanceOf(multisig), 1e18);
-    }
-
-    function test_PayloadBombTrackedAssetCanNotBlockOtherWithdrawals() public {
-        PayloadBombToken bomb = new PayloadBombToken();
-        (TreasuryVault t, uint256 a, uint256 b,) = _hostileSetup(bomb);
-        bomb.setHostile(true);
-        uint256 before = gasleft();
-        t.execute{gas: 2_000_000}(a);
-        // Two reads of the bomb cost at most two stipends on top of an ordinary execution.
-        assertLt(before - gasleft(), 500_000 + 2 * t.BALANCE_READ_GAS());
-        t.execute{gas: 2_000_000}(b);
-        assertEq(token.balanceOf(multisig), 250e18);
-        assertEq(imd.balanceOf(multisig), 25e18);
-    }
-
-    function test_SlowButHonestSecondEntryPointIsStillCharged() public {
-        DoubleEntryToken dbl = new DoubleEntryToken();
-        SlowLegacyEntry legacy = new SlowLegacyEntry(dbl);
-        dbl.setLegacy(address(legacy));
-        vm.prank(project);
-        TreasuryVault t = factory.createTreasury(address(dbl), project, 1 days, 2500, new address[](0));
-        dbl.mint(address(t), 1000e18);
-        vm.startPrank(project);
-        uint256 a = t.queue(address(dbl), multisig, 250e18);
-        uint256 b = t.queue(address(legacy), multisig, 1);
-        vm.stopPrank();
-        vm.warp(block.timestamp + 1 days);
-        // The expensive read fits in the stipend, so the shared cap still holds through both addresses.
-        vm.expectEmit(true, true, false, true, address(t));
-        emit TreasuryVault.SharedBalanceCharged(a, address(legacy), 250e18);
-        t.execute(a);
-        assertEq(t.availableThisWeek(address(legacy)), 0);
-        vm.expectRevert(abi.encodeWithSelector(TreasuryVault.OverWeeklyCap.selector, 0));
-        t.execute(b);
     }
 
     // =================== 444bc00c: an early small execute pins the epoch cap ahead of a deposit (documented) ===================

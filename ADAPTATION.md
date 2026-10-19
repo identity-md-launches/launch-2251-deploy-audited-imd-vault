@@ -1,59 +1,90 @@
 # Adaptation for the IMD launches (`evm_contracts`)
 
-## Revision: Robinhood Chain launch (chain id 4663, 2026-10-19)
+## Revision: Robinhood Chain launch (chain id 4663), second round (2026-10-19)
 
-This launch deploys the same `src/VaultFactory.sol` on Robinhood Chain with `imd_ = 0x0000000000000000000000000000000000000000`
-and `feeRecipient_ = 0x0000000000000000000000000000000000000000`, as the brief states: with `imd` zero the copy charges no
-fee and its creation paths never call a token; projects pay on the Ethereum factory (launch 2244,
-`0xdbaff609cd0500527a2a102f5cbbbbc70fd2ff5b`) with `payFor(4663, token or vault)`. Both zero words are the brief's own
-values for this chain, not stand-ins. `VaultFactory.sol` is untouched: its constructor is nonpayable, takes two static
-address arguments, calls no contract, and has no owner, `msg.sender` or `tx.origin` role; it deploys the two vaults
-itself with `new`. A scratch rehearsal of the protected floor (create2 of the factory with the two zero arguments on
-an empty chain with id 4663, then one vault of each kind) passed: runtime 18,984 bytes, init code 19,318 bytes, no
-DELEGATECALL, CALLCODE or SELFDESTRUCT in the factory or either vault.
+The brief: deploy the audited IMD Vault factory on Robinhood Chain, unchanged, the exact code deployed on Ethereum in
+launch 2244 (`0xdbaff609cd0500527a2a102f5cbbbbc70fd2ff5b`), with `imd_ = 0x0000000000000000000000000000000000000000`
+and `feeRecipient_ = 0x0000000000000000000000000000000000000000`; "do not change any source file: the audit is done".
+Both zero words are the brief's own values for this chain, not stand-ins: with `imd` zero the copy charges no fee and
+its creation paths never call a token, and projects pay on the Ethereum factory with `payFor(4663, token or vault)`.
 
-The brief asked for the code unchanged. The assignment also carries a pre-adaptation audit and requires that any
-finding which reproduces be fixed with a test, and its acceptance criteria allow a change only where a reproduced
-finding requires one. Each finding below was reproduced first on the code as it arrived (scratch tests, and the
-permanent tests in `test/Audit.t.sol` fail on the original source and pass now). Three findings held and were fixed
-with the smallest change that keeps every rule as written; one held and is documented, since its fix would change a
-rule the README states and the brief says to keep; one is the manifest; one is a coverage note. No owner, admin,
-pause, upgrade, mint or emergency path was added; `VaultFactory`'s bytecode changes only because it embeds the vaults'
-init code.
+The previous round edited `src/TreasuryVault.sol` and `src/VestingVault.sol` to fix three findings of the imported
+audit. The independent reviewer reopened the work on that: the factory embeds both vaults' init code, so its runtime
+is a fingerprint of all three sources, and the edited tree no longer compiled to the mainnet factory's code. That
+finding was reproduced here (`cast code` of the mainnet factory from a public Ethereum RPC on 2026-10-19: 18,760
+bytes, keccak256 `0x4e60104bbd26773631103e40fbbf5713e12e2d485564c8ee7222fbe57e30f98a`; the accepted tree before
+those edits, commit `ccfe47a`, compiles to exactly those bytes with the Ethereum arguments; the edited tree compiled
+to 18,984 bytes). It is the requester's explicit instruction, so this round restores the audited sources and makes
+no source change at all. The findings those edits answered are real and are listed below as known behaviours of the
+audited code, with the reason they are not fixed here; fixing them on Robinhood alone would ship vaults that differ
+from the Ethereum ones and verified source that does not match, and fixing them on both chains is a new Ethereum
+launch, which is the requester's decision, not the adapter's.
 
-| # | Finding (id) | File | Change | Test |
+### What is in the tree now
+
+| # | File | Change | Why | Test |
 |---|---|---|---|---|
-| 12 | medium `d9f3f847` `launch.json` carried the Ethereum constructor arguments (IMD token, `$owner`). On chain 4663 the IMD address has no code, so `_chargeOnce` would call `safeTransferFrom` on it and every creation path would revert; both arguments are immutable, so the factory would be bricked. Reproduced: `new VaultFactory(IERC20(0xD34a…), owner)` on chain 4663 reverts on `createLaunchVesting`, `vaultCount()` stays 0. | `launch.json` | The two `constructorArgs` are now the brief's `0x0000000000000000000000000000000000000000` twice and the notes describe the Robinhood copy. The manifest step owns this file and rewrites it after acceptance; it was changed here only because the Ethereum manifest in the tree is the reproduced defect, and so that the tree never again describes a factory that can not create a vault on this chain. The policy question the audit raised stands for the manifest step: the schema must accept the zero word for these two address arguments, since they are the brief's stated values for a contracts-only launch, not placeholders. No source change. | `test_RobinhoodFactoryWithZeroArgumentsCreatesVaultsAndTakesNoFee`: the Ethereum arguments revert on 4663, the zero arguments create all three vault kinds, `feePaid` stays false, no IMD moves, and `payFor` reverts `NoFeeOnThisChain`. |
-| 13 | medium `8894516c` `_charge` and `availableThisWeek` computed `balance * rateBps` in checked arithmetic; above `2^256 / rateBps` the multiplication panics, every `execute` of that asset reverts, nothing else can lower its balance, so the asset is locked and the radar's view reverts. Reproduced with the audit's proof (`1 << 255` of a uint256-max token, panic 0x11). | `src/TreasuryVault.sol` new `_cap`, used by `_charge` and `availableThisWeek` | The cap is `Math.mulDiv(balance, rateBps, BPS)` (OpenZeppelin 5.1.0, internal library): the same floor for every balance that did not overflow before, and a correct one for those that did. | `test_TreasuryCapHasNoOverflowForHugeBalances` (the proof's scenario, then the full 25% of a `uint256`-max balance leaves and not a wei more); `.imd/reads/proofs/Proof_8894516cbb00.t.sol` passes |
-| 14 | medium `959cdd52` `_tryBalance` forwarded all gas to each tracked asset's `balanceOf` and copied the whole payload. A tracked token that later burns the gas it receives (an upgraded or hostile token; tracked assets can never be removed) left `execute` with 1/64 of its gas twice over, so every ERC-20 withdrawal of every asset ran out of gas, against the NatSpec's promise. Reproduced: with one hostile tracked token, `execute` of an unrelated token reverts at a 10M gas limit (and survives 30M with a few thousand gas to spare). | `src/TreasuryVault.sol` `_tryBalance`, new constant `BALANCE_READ_GAS = 100_000`, NatSpec | Each read is a `staticcall` with a fixed 100 000 gas stipend, and only the first return word is copied (`returndatasize` check, `returndatacopy` of 32 bytes); a call that fails, needs more gas or returns less than a word reads as zero, as a reverting one already did. 100 000 gas is several times what a proxied or rebasing `balanceOf` costs; the manager alone grows the tracked set, so the worst case stays `2 × tracked × 100 000`. The cap semantics are unchanged. | `test_GasBurningTrackedAssetCanNotBlockOtherWithdrawals` (10M and 2M gas limits, the hostile asset is charged nothing, and is read again once benign), `test_PayloadBombTrackedAssetCanNotBlockOtherWithdrawals` (bounded cost), `test_SlowButHonestSecondEntryPointIsStillCharged` (a ~60k-gas honest read still enforces the shared cap) |
-| 15 | low `53c7bd14` `vestedAmount` computed `total * elapsed` in checked arithmetic; above `2^256 / duration` it panics, so `releasable` and `release` revert for the whole linear phase and the end-of-schedule early return then unlocks everything at once. Reproduced: a `uint256`-max allocation over 28 days reverts at day 1. | `src/VestingVault.sol` `vestedAmount` | `Math.mulDiv(total, elapsed, duration)`: identical result wherever the old expression did not overflow. | `test_VestingHugeAllocationVestsLinearly` (1/28 at day 1, 1/4 at day 7, all at day 28) |
+| 16 | `src/TreasuryVault.sol`, `src/VestingVault.sol` | Restored byte for byte to the audited launch 2244 source (`git checkout ccfe47a -- …`): the `Math.mulDiv` cap and vesting math, the `BALANCE_READ_GAS` stipend and the assembly `_tryBalance` of the previous round are gone. `src/VaultFactory.sol` was never touched. | Finding `8094ebd9` (reproduced) and the brief's "unchanged". | `test_TreeCompilesToTheAuditedMainnetFactory` (new): `new VaultFactory(IMD, 0x75dF…bBb8)` on chain id 1 has the mainnet runtime's length and codehash, so any edit to any of the three sources or to the compiler settings fails it. The reviewer's proof `Proof_8094ebd9e169` passes. |
+| 17 | `src/VaultFactoryNoFee.sol` (kept from the previous round) | A zero-argument subclass whose constructor passes `VaultFactory(IERC20(address(0)), address(0))`. It adds and overrides nothing; it exists only because the launch manifest refuses the zero address as a constructor word and the brief requires two zero words. Its runtime and immutables equal `new VaultFactory(0, 0)` of the restored, audited base. | Finding `d9f3f847` (the Ethereum arguments brick the factory on 4663) and the manifest's zero-word rule. | `test_NoFeeFactoryIsTheAuditedFactoryWithZeroArguments` (deployed code and codehash equal to `VaultFactory(0, 0)`), `test_NoFeeFactoryCreatesVaultsAndTakesNoFeeOnRobinhood`, `test_RobinhoodFactoryWithZeroArgumentsCreatesVaultsAndTakesNoFee`. |
+| 18 | `test/Audit.t.sol` | Dropped the five tests and four mocks that only pass on the edited source (`test_TreasuryCapHasNoOverflowForHugeBalances`, `test_VestingHugeAllocationVestsLinearly`, `test_GasBurningTrackedAssetCanNotBlockOtherWithdrawals`, `test_PayloadBombTrackedAssetCanNotBlockOtherWithdrawals`, `test_SlowButHonestSecondEntryPointIsStillCharged`; `MaxSupplyToken`, `GasBurningToken`, `PayloadBombToken`, `SlowLegacyEntry`). Added the mainnet-runtime test above. The cap-pinning test (`test_EarlyExecuteBeforeADepositOnlyDelaysToTheNextEpoch`) stays: it pins behaviour of the audited code. | They tested the reverted edits. | Suite: 114 tests pass (the 109 that arrived in launch 2244, the four tests of the previous round that hold on the audited code, and the new runtime test). |
+| 19 | `README.md` | The accounting notes no longer describe the stipend or `mulDiv`; they state the audited code's actual behaviour and the resulting operating rules (below). | Documentation must match the deployed code. | – |
+| 20 | `launch.json` | Unchanged from the previous accepted round: `VaultFactoryNoFee` with no arguments. The manifest step owns it. | – | – |
 
-Documented, not changed:
+### Reviewer findings of this round, and the imported audit, against the audited code
 
-- low `444bc00c` Anyone may execute a due withdrawal, so anyone can choose the moment an epoch's cap is fixed:
-  executing a small withdrawal just before a large deposit lands pins that epoch's cap to the pre-deposit balance, and
-  a large withdrawal queued earlier reverts `OverWeeklyCap` until the next epoch. Reproduced exactly as described. It
-  is the rule the README states ("the weekly cap is fixed by the first withdrawal executed in an epoch; deposits
-  later in the same epoch do not raise it"), encoded by the existing `test_TreasuryCapIgnoresDepositsWithinEpoch`,
-  and the brief says to keep the rules as written, so the suggested `max(balance at first execute, balance now)` would
-  be a change of rule, not a fix. The harm is smaller than the finding states: the pin only works in the epoch the
-  deposit lands in, since every later epoch opens on the full balance, so a queued withdrawal waits at most one epoch
-  and its 14-day grace period (at least two epochs) covers that; two griefs in a row need two deposits. Nothing can be
-  taken. The README now states it, and `test_EarlyExecuteBeforeADepositOnlyDelaysToTheNextEpoch` pins that bound.
-- info `0139c6de` Coverage note, not a defect. The fork test still skips without `FORK_RPC`; no live check of
-  Robinhood Chain was run here either. The brief states `/requests/check` passed on 4663.
+Every one of these was reproduced on the restored code with a scratch test (the reviewer's proofs under
+`test/scratch/`, and a scratch test for the three advisory ones). None is fixed, by the brief's instruction above;
+each is stated in the README so the requester and the radar can act on it. `.imd-responses.json` answers each id.
 
-Noted for the reviewer, outside the audit's findings: the tracked-asset set (change 7, accepted earlier) trusts what a
-tracked token answers. A token that misreports its balance as falling when another asset leaves is charged against
-its own window and can make ERC-20 withdrawals revert `OverWeeklyCap`; the gas stipend does not cover that. Only the
-manager can bring a token into the set, ETH withdrawals are unaffected, and guarding it would mean letting the manager
-remove a tracked asset, which loosens the shared-cap rule. Left as a documented trust assumption in the README.
+- medium `8094ebd9` Tree differed from the audited launch 2244 code. **Fixed** (change 16). The proof passes.
+- medium `9c7bf39d` A tracked ERC-20 whose `balanceOf` mirrors another balance can make every ERC-20 `execute`
+  revert `OverWeeklyCap`, and tracked assets are never removed. Reproduced exactly (proof fails with
+  `OverWeeklyCap(2.5e39)`). It is the audited code's behaviour on Ethereum today, and the reviewer notes the fix
+  conflicts with finding `8094ebd9`. **Disputed as a change for this launch**: both of the reviewer's fix options (a
+  consistency check in `execute`, or a manager path to untrack) change `TreasuryVault.sol`, which changes the
+  factory's runtime and fails the held proof `Proof_8094ebd9e169`; the two proofs can not both pass. Documented in the
+  README as an operating rule: the manager must never queue a token it does not trust; an unsolicited airdrop stays
+  where it is. ETH withdrawals are unaffected and nothing can be taken.
+- medium `4e5bed0c` In an open vault, anyone holding a wei of a token that already exists can record its arrival
+  early, so a real tranche landing later vests by the fraction of the schedule elapsed since the dust. Reproduced
+  exactly (proof fails with `750000e18 > 1`). Same reasoning: a per-tranche clock or a different arrival rule changes
+  `VestingVault.sol` and the factory's runtime. **Disputed as a change for this launch**; documented in the README
+  (an open vault's clock is only trustworthy for a token minted in the funding transaction, the IMD launch case; the
+  radar refuses its seal to an open vault holding a token that existed before the vault; use `createVesting` for an
+  existing token). The beneficiary can only hurry their own lock; nothing goes to a third party.
+- low `d6e1656f` The withdrawn asset is charged its nominal amount, so a token that debits the sender more than the
+  amount lets more than `rateBps` leave (reproduced: 27.5% left, `spent` 250e18). Not changed; README states it.
+- low `7e1f83d4` `release` moves the whole releasable amount, so such a token can never complete its final release in
+  a bound vault (reproduced: `release` reverts after the schedule, forever). Not changed; README says not to vest
+  such a token here.
+- info `e6655eea` `availableThisWeek` ignores shared-balance charges for an untracked second entry point
+  (reproduced). Not changed; README states it.
+- medium `8894516c` (imported audit) `balance × rateBps` overflows above `2^256 / rateBps` and locks the asset; its
+  proof `Proof_8894516cbb00` passed on the previous round's edit and fails again on the audited code (panic 0x11).
+  Not fixed for the reason above; README says a `uint256`-max supply token must not be put in these vaults.
+- medium `959cdd52` (imported audit) A tracked token that burns gas or returns a huge payload runs `execute` out of
+  gas. Reproduced in the previous round. Not fixed; same reason; README operating rule as for `9c7bf39d`.
+- low `53c7bd14` (imported audit) `total × elapsed` overflows for an allocation above `2^256 / duration`.
+  Reproduced in the previous round. Not fixed; same reason; README states it.
+- low `444bc00c` (imported audit) Anyone can fix the epoch cap ahead of a deposit. Reproduced; it is the README's
+  rule as written and the harm is one epoch's delay inside the grace period; `test_EarlyExecuteBeforeADepositOnlyDelaysToTheNextEpoch` pins that bound.
+- medium `d9f3f847` (imported audit) The Ethereum arguments brick the factory on 4663. Fixed in the previous round
+  (change 17 and `launch.json`).
+- info `0139c6de` (imported audit) Coverage note. The fork test still skips without `FORK_RPC`.
 
-Verified with `forge build` and `forge test` (116 tests: the 109 that arrived and 7 new in `test/Audit.t.sol`) with
-the verifier's fuzz seed and with another seed.
+If the requester wants the fixes of `8894516c`, `959cdd52`, `53c7bd14`, `9c7bf39d` or `4e5bed0c` live, they are a
+new audited release on both chains (the previous round's edits are in this repository's history at commit
+`98fd654`), not a change to this launch.
 
-Tests: `test/Audit.t.sol` gains `MaxSupplyToken`, `GasBurningToken`, `PayloadBombToken` and `SlowLegacyEntry` mocks
-and the seven tests above. No existing test changed.
+Verified with `forge build` and `forge test` (114 tests) with the verifier's fuzz seed
+`0xb224989c52744aedbf7c0bd00fdb05a72a2e7c35ff4eb1dbdd54ea3ed4ba2ae5`. The protected floor's conditions hold as before
+for the audited runtime: 18,760 bytes, nonpayable constructor with no external call, no DELEGATECALL, CALLCODE or
+SELFDESTRUCT, no owner or admin.
+
+## Revision: Robinhood Chain launch, first round (superseded)
+
+The first round changed `launch.json` to the Robinhood copy and added `src/VaultFactoryNoFee.sol` (both kept, changes
+17 and 20), and edited the two vault sources for findings `8894516c`, `959cdd52` and `53c7bd14` (reverted, change 16).
 
 # Adaptation for the Ethereum launch (`evm_contracts`, launch 2244)
 
