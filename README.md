@@ -32,8 +32,18 @@ Nothing has an admin, a pause, an upgrade path or an emergency withdrawal.
   transfer: a balance that fell is charged against that asset's window too, so a token with two addresses to one
   balance (a legacy contract forwarding to the main token, a proxy and its target) shares one 25% window once both
   addresses have been queued. An address nobody queued keeps a window of its own. A tracked asset that can not be
-  read (no code, or a reverting `balanceOf`) is skipped, never a block. The manager alone grows that set and pays for
-  the loop it adds.
+  read (no code, a reverting `balanceOf`, or one that needs more than `BALANCE_READ_GAS` = 100 000 gas) is skipped,
+  never a block: each read gets that fixed stipend and only its first word is copied, so a tracked token that later
+  burns gas or returns a huge payload counts as zero instead of running the withdrawal out of gas. The manager alone
+  grows that set and pays for the loop it adds. The set trusts what a tracked token answers: a token that lies about
+  its balance (reports it falling when another asset leaves) can make ERC-20 withdrawals revert against its window;
+  only the manager can bring a token into the set.
+- The cap and the vesting amount are computed with `mulDiv`, so a balance or allocation near `2^256` (uint256-max
+  supplies exist) is capped and vested like any other instead of reverting.
+- Anyone can execute a due withdrawal, so anyone can choose the moment an epoch's cap is fixed. Executing a small
+  withdrawal just before a large deposit lands pins the cap to the pre-deposit balance for that epoch, and a large
+  withdrawal queued earlier waits for the next epoch, which opens on the full balance. That is the rule above as
+  written; the 14-day grace period covers the wait, so nothing is lost and nothing can be taken.
 - The cap is `rateBps` of the balance rounded down, so a balance below `10_000 / rateBps` base units (3 units at
   25%, 9 999 at 1 bps) has a cap of zero until something is deposited, and since each epoch moves at most `rateBps`
   of what is left, an asset decays geometrically and the last dust of it never leaves. That is the rule as written.
@@ -93,12 +103,16 @@ the vesting payout, the 25%-a-week vesting ceiling and the treasury weekly cap. 
 audit finding fixed before the launch (see [ADAPTATION.md](ADAPTATION.md)): the start floor, the arrival clock of open
 vaults, the schedule overflow, `recover()` against double-entry tokens, the treasury's own 24h floor, the real
 bound of the epoch cap, the shared cap of a double-entry token in a treasury, the fixed expiry of a queued
-withdrawal, the pending manager's delay, the creator in the registry and the received amount in `VestingCreated`.
+withdrawal, the pending manager's delay, the creator in the registry and the received amount in `VestingCreated`;
+and, from the Robinhood launch, the zero-argument factory on chain 4663, the overflow-free cap and vesting math, the
+gas stipend on tracked-asset reads and the documented cap-pinning bound.
 
 ## Addresses
 
 - IMD (Ethereum): `0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`
-- VaultFactory: not deployed yet. Ethereum: `new VaultFactory(IMD, radarWallet)`. Robinhood: `new VaultFactory(address(0), address(0))`.
+- VaultFactory (Ethereum, launch 2244): `0xdbaff609cd0500527a2a102f5cbbbbc70fd2ff5b`, `new VaultFactory(IMD, radarWallet)`.
+- VaultFactory (Robinhood Chain, 4663): deployed by the IMD launch as `new VaultFactory(address(0), address(0))`;
+  no fee on this chain, `payFor(4663, token)` on the Ethereum factory instead.
 
 ## The IMD RADAR seal
 

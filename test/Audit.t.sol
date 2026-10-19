@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {VaultFactory} from "../src/VaultFactory.sol";
+import {VaultFactoryNoFee} from "../src/VaultFactoryNoFee.sol";
 import {VestingVault} from "../src/VestingVault.sol";
 import {TreasuryVault} from "../src/TreasuryVault.sol";
 
@@ -61,6 +62,81 @@ contract AuditFeeToken is AuditToken {
             value -= fee;
         }
         super._update(from, to, value);
+    }
+}
+
+/// @dev A token with a uint256-max supply, as some meme tokens have.
+contract MaxSupplyToken is ERC20 {
+    constructor() ERC20("MAX", "MAX") {
+        _mint(msg.sender, type(uint256).max);
+    }
+}
+
+/// @dev A tracked token that turns hostile: while `hostile`, `balanceOf` burns every unit of gas it is given.
+contract GasBurningToken is AuditToken {
+    bool public hostile;
+
+    constructor() AuditToken("BURN") {}
+
+    function setHostile(bool h) external {
+        hostile = h;
+    }
+
+    function balanceOf(address a) public view override returns (uint256) {
+        if (hostile) {
+            uint256 x;
+            while (true) {
+                x = uint256(keccak256(abi.encode(x)));
+            }
+        }
+        return super.balanceOf(a);
+    }
+}
+
+/// @dev A tracked token that turns hostile: while `hostile`, `balanceOf` tries to return a 1 MiB payload.
+contract PayloadBombToken is AuditToken {
+    bool public hostile;
+
+    constructor() AuditToken("BOMB") {}
+
+    function setHostile(bool h) external {
+        hostile = h;
+    }
+
+    function balanceOf(address a) public view override returns (uint256) {
+        if (hostile) {
+            assembly {
+                return(0, 0x100000)
+            }
+        }
+        return super.balanceOf(a);
+    }
+}
+
+/// @dev A second entry point whose `balanceOf` is expensive but honest (about 60k gas of work before it answers),
+///      like a token that derives balances from several storage reads: it must still be read under the stipend.
+contract SlowLegacyEntry {
+    DoubleEntryToken immutable main;
+    uint256[] private pad;
+
+    constructor(DoubleEntryToken main_) {
+        main = main_;
+        for (uint256 i; i < 25; ++i) {
+            pad.push(i + 1);
+        }
+    }
+
+    function balanceOf(address a) external view returns (uint256) {
+        uint256 sink;
+        for (uint256 i; i < pad.length; ++i) {
+            sink += pad[i]; // 25 cold reads, about 55k gas
+        }
+        return sink == 0 ? 0 : main.balanceOf(a);
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        main.transferFor(msg.sender, to, amount);
+        return true;
     }
 }
 
@@ -549,5 +625,268 @@ contract AuditTest is Test {
         VestingVault v = factory.createVesting(IERC20(address(fee)), team, 1000e18, now_, 0, 28 days);
         vm.stopPrank();
         assertEq(fee.balanceOf(address(v)), 990e18);
+    }
+
+    // =================== Robinhood launch (chain 4663): the fixes below were made for it ===================
+
+    // =================== d9f3f847: the Ethereum constructor arguments brick the factory on Robinhood ===================
+
+    function test_RobinhoodFactoryWithZeroArgumentsCreatesVaultsAndTakesNoFee() public {
+        vm.chainId(4663);
+        // The Ethereum manifest's arguments: IMD has no code on 4663, so every creation path reverts in the fee.
+        VaultFactory wrong = new VaultFactory(IERC20(0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7), radar);
+        vm.prank(project);
+        vm.expectRevert();
+        wrong.createLaunchVesting(team, uint64(block.timestamp), 0, 28 days);
+        assertEq(wrong.vaultCount(), 0);
+
+        // The brief's arguments for this chain: both zero, no fee, no token call, every path works.
+        VaultFactory free = new VaultFactory(IERC20(address(0)), address(0));
+        assertEq(address(free.imd()), address(0));
+        assertEq(free.feeRecipient(), address(0));
+        vm.startPrank(project);
+        token.approve(address(free), type(uint256).max);
+        VestingVault open = free.createLaunchVesting(team, uint64(block.timestamp), 0, 28 days);
+        VestingVault bound =
+            free.createVesting(IERC20(address(token)), team, 1000e18, uint64(block.timestamp), 0, 28 days);
+        TreasuryVault t = free.createTreasury(address(token), project, 1 days, 2500, new address[](0));
+        vm.expectRevert(VaultFactory.NoFeeOnThisChain.selector);
+        free.payFor(4663, address(token));
+        vm.stopPrank();
+        assertEq(free.vaultCount(), 3);
+        assertTrue(free.isVault(address(open)) && free.isVault(address(bound)) && free.isVault(address(t)));
+        assertFalse(free.feePaid(4663, address(token)));
+        assertFalse(free.feePaid(4663, address(open)));
+        assertEq(imd.balanceOf(radar), 0);
+        assertEq(token.balanceOf(address(bound)), 1000e18);
+    }
+
+    /// @dev The launch manifest refuses the zero address as a constructor word, so the Robinhood copy is deployed as
+    ///      `VaultFactoryNoFee`, a zero-argument subclass that passes the brief's two zero values itself. It must be
+    ///      the audited factory and nothing else: the same deployed code, byte for byte, as
+    ///      `new VaultFactory(IERC20(address(0)), address(0))`, with the same immutables.
+    function test_NoFeeFactoryIsTheAuditedFactoryWithZeroArguments() public {
+        vm.chainId(4663);
+        VaultFactory audited = new VaultFactory(IERC20(address(0)), address(0));
+        VaultFactoryNoFee launched = new VaultFactoryNoFee();
+        assertEq(address(launched).code, address(audited).code, "deployed code differs from VaultFactory(0, 0)");
+        assertEq(address(launched).codehash, address(audited).codehash);
+        assertEq(address(launched).code.length, address(audited).code.length);
+        assertLe(address(launched).code.length, 24_576, "runtime exceeds EIP-170");
+        assertEq(address(launched.imd()), address(0));
+        assertEq(launched.feeRecipient(), address(0));
+        assertEq(launched.FEE(), audited.FEE());
+        assertEq(launched.BENEFICIARY_DELAY(), audited.BENEFICIARY_DELAY());
+        assertEq(launched.MIN_DELAY(), audited.MIN_DELAY());
+        // No owner, admin or factory role: the only addresses the contract stores are the two zero words.
+        assertEq(address(launched.imd()), address(0));
+        assertEq(launched.feeRecipient(), address(0));
+    }
+
+    /// @dev The no-fee factory does on chain 4663 what the brief asks of `VaultFactory(0, 0)`: every creation path
+    ///      works for anyone, no IMD is asked for or moves, nothing is marked paid, and `payFor` is refused here.
+    function test_NoFeeFactoryCreatesVaultsAndTakesNoFeeOnRobinhood() public {
+        vm.chainId(4663);
+        VaultFactoryNoFee free = new VaultFactoryNoFee();
+        address[] memory dests = new address[](1);
+        dests[0] = multisig;
+
+        vm.startPrank(project);
+        token.approve(address(free), type(uint256).max);
+        VestingVault open = free.createLaunchVesting(team, uint64(block.timestamp + 1 days), 7 days, 56 days);
+        VestingVault bound =
+            free.createVesting(IERC20(address(token)), team, 1000e18, uint64(block.timestamp), 0, 28 days);
+        TreasuryVault t = free.createTreasury(address(token), project, 1 days, 2500, dests);
+        TreasuryVault openTreasury = free.createTreasury(address(0), project, 2 days, 1000, new address[](0));
+        vm.expectRevert(VaultFactory.NoFeeOnThisChain.selector);
+        free.payFor(4663, address(token));
+        vm.expectRevert(VaultFactory.NoFeeOnThisChain.selector);
+        free.payFor(1, address(token));
+        vm.stopPrank();
+
+        // A wallet with no IMD at all, and no approval, creates vaults too: nothing is charged on this chain.
+        vm.prank(stranger);
+        VestingVault strangerVault = free.createLaunchVesting(stranger, uint64(block.timestamp), 0, 28 days);
+
+        assertEq(free.vaultCount(), 5);
+        assertTrue(free.isVault(address(open)) && free.isVault(address(bound)) && free.isVault(address(t)));
+        assertTrue(free.isVault(address(openTreasury)) && free.isVault(address(strangerVault)));
+        assertEq(free.creatorOf(address(open)), project);
+        assertEq(free.creatorOf(address(strangerVault)), stranger);
+        assertEq(free.vaultsByToken(address(token)).length, 2);
+        assertEq(free.vaultsByToken(address(0)).length, 3);
+        assertFalse(free.feePaid(4663, address(token)));
+        assertFalse(free.feePaid(4663, address(open)));
+        assertFalse(free.feePaid(4663, address(openTreasury)));
+        assertEq(imd.balanceOf(radar), 0);
+        assertEq(imd.balanceOf(project), 1000e18);
+        assertEq(token.balanceOf(address(bound)), 1000e18);
+        assertEq(address(bound.token()), address(token));
+        assertEq(bound.beneficiary(), team);
+        assertEq(t.manager(), project);
+        assertEq(t.rateBps(), 2500);
+        assertEq(t.delay(), 1 days);
+        assertTrue(t.isDestination(multisig));
+        // The Ethereum factory in the same tree still charges: the two copies differ only by their arguments.
+        vm.prank(project);
+        factory.createLaunchVesting(team, uint64(block.timestamp), 0, 28 days);
+        assertEq(imd.balanceOf(radar), 5e18);
+    }
+
+    // =================== 8894516c: the weekly cap overflowed for huge balances and locked the asset ===================
+
+    function test_TreasuryCapHasNoOverflowForHugeBalances() public {
+        vm.prank(project);
+        TreasuryVault t = factory.createTreasury(address(token), project, 1 days, 2500, new address[](0));
+        MaxSupplyToken huge = new MaxSupplyToken();
+        huge.transfer(address(t), 1 << 255);
+        vm.prank(project);
+        uint256 id = t.queue(address(huge), multisig, 1e18);
+        vm.warp(block.timestamp + 1 days);
+
+        uint256 cap = t.availableThisWeek(address(huge));
+        assertEq(cap, (1 << 255) / 4);
+        t.execute(id);
+        assertEq(huge.balanceOf(multisig), 1e18);
+        assertEq(t.availableThisWeek(address(huge)), cap - 1e18);
+
+        // The whole cap can leave, and not a wei more, even at the largest possible balance.
+        huge.transfer(address(t), type(uint256).max - (1 << 255));
+        vm.warp((block.timestamp / t.EPOCH() + 1) * t.EPOCH());
+        uint256 held = huge.balanceOf(address(t));
+        vm.startPrank(project);
+        uint256 all = t.queue(address(huge), multisig, held / 4);
+        uint256 more = t.queue(address(huge), multisig, 1);
+        vm.stopPrank();
+        vm.warp(block.timestamp + 1 days);
+        assertEq(t.availableThisWeek(address(huge)), held / 4);
+        t.execute(all);
+        vm.expectRevert(abi.encodeWithSelector(TreasuryVault.OverWeeklyCap.selector, 0));
+        t.execute(more);
+    }
+
+    // =================== 53c7bd14: the vesting math overflowed for huge allocations ===================
+
+    function test_VestingHugeAllocationVestsLinearly() public {
+        MaxSupplyToken huge = new MaxSupplyToken();
+        huge.approve(address(factory), type(uint256).max);
+        imd.mint(address(this), 5e18);
+        imd.approve(address(factory), 5e18);
+        VestingVault v =
+            factory.createVesting(IERC20(address(huge)), team, type(uint256).max, uint64(block.timestamp), 0, 28 days);
+        assertEq(v.releasable(address(huge)), 0);
+        vm.warp(block.timestamp + 1 days);
+        assertEq(v.releasable(address(huge)), type(uint256).max / 28);
+        v.release(address(huge));
+        assertEq(huge.balanceOf(team), type(uint256).max / 28);
+        vm.warp(block.timestamp + 6 days);
+        assertEq(v.vestedAmount(address(huge), uint64(block.timestamp)), type(uint256).max / 4);
+        v.release(address(huge));
+        assertEq(huge.balanceOf(team), type(uint256).max / 4);
+        vm.warp(block.timestamp + 21 days);
+        v.release(address(huge));
+        assertEq(huge.balanceOf(team), type(uint256).max);
+    }
+
+    // =================== 959cdd52: a tracked asset that turned hostile froze every ERC-20 withdrawal ===================
+
+    function _hostileSetup(AuditToken hostile)
+        internal
+        returns (TreasuryVault t, uint256 viaToken, uint256 viaImd, uint256 viaHostile)
+    {
+        vm.prank(project);
+        t = factory.createTreasury(address(token), project, 1 days, 2500, new address[](0));
+        hostile.mint(address(t), 100e18);
+        token.mint(address(t), 1000e18);
+        imd.mint(address(t), 100e18);
+        vm.startPrank(project);
+        viaHostile = t.queue(address(hostile), multisig, 1e18); // the asset is tracked while it is still benign
+        viaToken = t.queue(address(token), multisig, 250e18);
+        viaImd = t.queue(address(imd), multisig, 25e18);
+        vm.stopPrank();
+        vm.warp(block.timestamp + 1 days);
+    }
+
+    function test_GasBurningTrackedAssetCanNotBlockOtherWithdrawals() public {
+        GasBurningToken burner = new GasBurningToken();
+        (TreasuryVault t, uint256 a, uint256 b, uint256 h) = _hostileSetup(burner);
+        burner.setHostile(true);
+        // Before the fix each read forwarded all gas and left the caller 1/64: this call ran out of gas.
+        t.execute{gas: 10_000_000}(a);
+        t.execute{gas: 2_000_000}(b);
+        assertEq(token.balanceOf(multisig), 250e18);
+        assertEq(imd.balanceOf(multisig), 25e18);
+        // The unreadable asset is charged nothing, and its own withdrawal fails only because it reverts itself.
+        (uint64 epoch,,) = t.windows(address(burner));
+        assertEq(epoch, 0);
+        vm.expectRevert();
+        t.execute(h);
+        // Once it is benign again it is read and charged as before.
+        burner.setHostile(false);
+        t.execute(h);
+        assertEq(burner.balanceOf(multisig), 1e18);
+    }
+
+    function test_PayloadBombTrackedAssetCanNotBlockOtherWithdrawals() public {
+        PayloadBombToken bomb = new PayloadBombToken();
+        (TreasuryVault t, uint256 a, uint256 b,) = _hostileSetup(bomb);
+        bomb.setHostile(true);
+        uint256 before = gasleft();
+        t.execute{gas: 2_000_000}(a);
+        // Two reads of the bomb cost at most two stipends on top of an ordinary execution.
+        assertLt(before - gasleft(), 500_000 + 2 * t.BALANCE_READ_GAS());
+        t.execute{gas: 2_000_000}(b);
+        assertEq(token.balanceOf(multisig), 250e18);
+        assertEq(imd.balanceOf(multisig), 25e18);
+    }
+
+    function test_SlowButHonestSecondEntryPointIsStillCharged() public {
+        DoubleEntryToken dbl = new DoubleEntryToken();
+        SlowLegacyEntry legacy = new SlowLegacyEntry(dbl);
+        dbl.setLegacy(address(legacy));
+        vm.prank(project);
+        TreasuryVault t = factory.createTreasury(address(dbl), project, 1 days, 2500, new address[](0));
+        dbl.mint(address(t), 1000e18);
+        vm.startPrank(project);
+        uint256 a = t.queue(address(dbl), multisig, 250e18);
+        uint256 b = t.queue(address(legacy), multisig, 1);
+        vm.stopPrank();
+        vm.warp(block.timestamp + 1 days);
+        // The expensive read fits in the stipend, so the shared cap still holds through both addresses.
+        vm.expectEmit(true, true, false, true, address(t));
+        emit TreasuryVault.SharedBalanceCharged(a, address(legacy), 250e18);
+        t.execute(a);
+        assertEq(t.availableThisWeek(address(legacy)), 0);
+        vm.expectRevert(abi.encodeWithSelector(TreasuryVault.OverWeeklyCap.selector, 0));
+        t.execute(b);
+    }
+
+    // =================== 444bc00c: an early small execute pins the epoch cap ahead of a deposit (documented) ===================
+
+    /// @dev The README's rule: the cap is fixed by the first execute of the epoch and deposits later in the epoch do
+    ///      not raise it. Anyone can choose that moment, so a large withdrawal queued before a deposit can be held to
+    ///      the next epoch, which starts on the full balance; the grace period covers it, so nothing is lost.
+    function test_EarlyExecuteBeforeADepositOnlyDelaysToTheNextEpoch() public {
+        vm.prank(project);
+        TreasuryVault t = factory.createTreasury(address(token), project, 1 days, 2500, new address[](0));
+        token.mint(address(t), 100e18);
+        vm.startPrank(project);
+        uint256 small = t.queue(address(token), multisig, 1e18);
+        uint256 large = t.queue(address(token), multisig, 25_000e18);
+        vm.stopPrank();
+        uint256 epochStart = ((block.timestamp + 1 days) / t.EPOCH() + 1) * t.EPOCH();
+        vm.warp(epochStart);
+        vm.prank(stranger);
+        t.execute(small); // pins this epoch's cap to 25% of 100e18
+        token.mint(address(t), 100_000e18);
+        assertEq(t.availableThisWeek(address(token)), 24e18);
+        vm.expectRevert(abi.encodeWithSelector(TreasuryVault.OverWeeklyCap.selector, 24e18));
+        t.execute(large);
+        // Next epoch opens on the full balance and the withdrawal is still inside its grace period.
+        vm.warp(epochStart + t.EPOCH());
+        (,,,, uint64 expiresAt,) = t.withdrawals(large);
+        assertLe(block.timestamp, expiresAt);
+        t.execute(large);
+        assertEq(token.balanceOf(multisig), 25_001e18);
     }
 }
